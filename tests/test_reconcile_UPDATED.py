@@ -14,13 +14,21 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from reconcile import reconcile
 
 
-def make_trade(trade_id="T0001", ticker="AAPL", side="BUY", quantity=100,
-                price=150.0, trade_date="2026-08-03", settle_date="2026-08-05"):
+def make_trade(trade_id="T0001", ticker="AAPL", instrument_type="EQUITY", side="BUY",
+                quantity=100, price=150.0, trade_date="2026-08-03",
+                expiry="", strike="", right=""):
     return {
-        "trade_id": trade_id, "ticker": ticker, "side": side,
-        "quantity": quantity, "price": price,
-        "trade_date": trade_date, "settle_date": settle_date,
+        "trade_id": trade_id, "ticker": ticker, "instrument_type": instrument_type,
+        "side": side, "quantity": quantity, "price": price, "trade_date": trade_date,
+        "expiry": expiry, "strike": strike, "right": right,
     }
+
+
+def make_option(trade_id="T0001", ticker="ASTS", side="BUY", quantity=1,
+                 price=550.0, trade_date="2026-08-28", expiry="16-10-2026",
+                 strike="60", right="C"):
+    return make_trade(trade_id, ticker, "OPTION", side, quantity, price,
+                       trade_date, expiry, strike, right)
 
 
 def break_types(breaks):
@@ -94,6 +102,57 @@ def test_composite_key_rescues_shifted_trade_id():
     breaks, _ = reconcile([b], [c])
     assert len(breaks) == 1
     assert breaks[0]["break_type"] == "DATE_MISMATCH"
+
+
+def test_options_with_same_underlying_and_side_are_not_confused():
+    """Two different option contracts (different strikes) on the same
+    ticker/side/quantity must NOT be matched to each other via the
+    composite-key fallback - that would silently hide a real break
+    (wrong strike booked) as a false clean match."""
+    broker = [
+        make_option("T0001", ticker="ASTS", strike="60", price=550.0),
+        make_option("T0002", ticker="ASTS", strike="65", price=610.0),
+    ]
+    custodian = [
+        # both trade_ids intentionally scrambled so this only resolves
+        # via the composite key, not the trade_id fast path
+        make_option("X0001", ticker="ASTS", strike="60", price=550.0),
+        make_option("X0002", ticker="ASTS", strike="65", price=610.0),
+    ]
+    breaks, matched = reconcile(broker, custodian)
+    # Should be 4 breaks total: both broker trades unmatched (custodian
+    # ids don't line up and composite key differs only by trade_id, which
+    # isn't part of the key) - the key point is nothing gets silently
+    # cross-matched between the two different strikes.
+    assert not any(
+        b["break_type"] == "QUANTITY_MISMATCH" or b["break_type"] == "PRICE_MISMATCH"
+        for b in breaks
+    ), "a $60 strike and a $65 strike must never be compared as if they were the same contract"
+
+
+def test_option_matched_via_composite_key_flags_id_mismatch():
+    """If trade_id is corrupted but strike/expiry/right/ticker/side/qty all
+    match, the engine still flags that the reference IDs didn't line up
+    (useful in its own right - two systems disagreeing on a trade's
+    reference is worth a note) rather than declaring a silent clean match."""
+    b = make_option("T0001", strike="60")
+    c = make_option("T9999", strike="60")  # id corrupted, everything else identical
+    breaks, matched = reconcile([b], [c])
+    assert len(breaks) == 1
+    assert "via ticker/side/qty only" in breaks[0]["detail"]
+
+
+def test_zero_price_trade_uses_absolute_not_relative_tolerance():
+    """A free/promo share booked at price 0 must not divide by zero -
+    should fall back to an absolute cent-level tolerance instead."""
+    b = make_trade("T0001", price=0.0)
+    c = make_trade("T0001", price=0.0)
+    breaks, matched = reconcile([b], [c])
+    assert breaks == []
+
+    c_diff = make_trade("T0001", price=0.02)
+    breaks2, _ = reconcile([b], [c_diff])
+    assert break_types(breaks2) == ["PRICE_MISMATCH"]
 
 
 def test_no_trade_silently_dropped():

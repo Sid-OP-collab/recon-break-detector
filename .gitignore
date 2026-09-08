@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 venv/
+
+# Real trade data - never commit. Only the synthetic data/ folder
+# (from generate_mock_data.py) is meant to be public.
+data_real/
+output_real/

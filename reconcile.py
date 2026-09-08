@@ -28,7 +28,10 @@ import csv
 from collections import defaultdict
 
 
-FIELDS = ["trade_id", "ticker", "side", "quantity", "price", "trade_date", "settle_date"]
+FIELDS = ["trade_id", "ticker", "instrument_type", "side", "quantity", "price",
+          "trade_date", "expiry", "strike", "right"]
+
+QUANTITY_TOLERANCE = 1e-6  # float rounding noise, not a real break
 
 
 def load_ledger(path):
@@ -36,7 +39,7 @@ def load_ledger(path):
         reader = csv.DictReader(f)
         rows = list(reader)
     for r in rows:
-        r["quantity"] = int(r["quantity"])
+        r["quantity"] = float(r["quantity"])
         r["price"] = float(r["price"])
     return rows
 
@@ -50,10 +53,27 @@ def index_by_id(rows):
 
 
 def composite_key(row):
-    """Fallback match key when trade_id doesn't line up: ticker + side + quantity.
-    Deliberately excludes date/price, since those are exactly the fields we
-    want to be ABLE to flag as mismatched once a trade is found this way."""
-    return (row["ticker"], row["side"], row["quantity"])
+    """Fallback match key when trade_id doesn't line up.
+
+    Equities: ticker + side + quantity is enough - one AAPL BUY of 0.5
+    shares is the same economic trade regardless of which system's ID
+    labels it.
+
+    Options are NOT safe to key the same way: two calls on the same
+    underlying, same side, same quantity (typically 1 contract) can be
+    completely different instruments if the strike or expiry differs.
+    A $60-strike ASTS call and a $65-strike ASTS call must never be
+    treated as candidates for the same match, or a real break (wrong
+    strike booked) would be silently swallowed instead of flagged.
+    So for OPTION rows the key also includes expiry/strike/right.
+
+    Either way, trade_date and price are deliberately excluded, since
+    those are exactly the fields we want to be free to flag as
+    mismatched once a trade is found via this fallback."""
+    base = (row["ticker"], row["side"], round(row["quantity"], 6))
+    if row.get("instrument_type") == "OPTION":
+        return base + (row.get("expiry", ""), row.get("strike", ""), row.get("right", ""))
+    return base
 
 
 def reconcile(broker_rows, custodian_rows):
@@ -133,10 +153,17 @@ def reconcile(broker_rows, custodian_rows):
 def compare_fields(tid, b, c, note=None):
     """Given a matched broker/custodian pair, return a list of field-level breaks."""
     out = []
-    if b["quantity"] != c["quantity"]:
+    if abs(b["quantity"] - c["quantity"]) > QUANTITY_TOLERANCE:
         out.append({"trade_id": tid, "break_type": "QUANTITY_MISMATCH",
                      "detail": f"broker qty {b['quantity']} vs custodian qty {c['quantity']}" + (f" ({note})" if note else "")})
-    if abs(b["price"] - c["price"]) / b["price"] > 0.0001:
+    # Relative (1bp) tolerance normally; falls back to an absolute cent
+    # threshold when broker price is exactly 0 (e.g. a free/promo share)
+    # since a relative diff is undefined against a zero denominator.
+    price_break = (
+        abs(b["price"] - c["price"]) > 0.01 if b["price"] == 0
+        else abs(b["price"] - c["price"]) / b["price"] > 0.0001
+    )
+    if price_break:
         out.append({"trade_id": tid, "break_type": "PRICE_MISMATCH",
                      "detail": f"broker price {b['price']} vs custodian price {c['price']}" + (f" ({note})" if note else "")})
     if b["trade_date"] != c["trade_date"]:

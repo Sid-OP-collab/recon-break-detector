@@ -18,7 +18,7 @@ jobs:
         run: pip install pytest
       - name: Run tests
         run: pytest tests/ -v
-      - name: Generate mock data
+      - name: Generate synthetic mock data (for a reproducible CI run)
         run: python generate_mock_data.py
-      - name: Run reconciliation
+      - name: Run reconciliation on synthetic data
         run: python reconcile.py
