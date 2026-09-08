@@ -1,0 +1,15 @@
+trade_id,break_type,detail
+T0026,MISSING_IN_CUSTODIAN,dropped from custodian feed
+T0023,MISSING_IN_CUSTODIAN,dropped from custodian feed
+T0029,MISSING_IN_CUSTODIAN,dropped from custodian feed
+T0016,QUANTITY_MISMATCH,broker qty 200 vs custodian qty 190
+T0005,QUANTITY_MISMATCH,broker qty 75 vs custodian qty 65
+T0024,QUANTITY_MISMATCH,broker qty 200 vs custodian qty 205
+T0017,PRICE_MISMATCH,broker price 318.14 vs custodian price 316.64
+T0040,PRICE_MISMATCH,broker price 651.66 vs custodian price 650.16
+T0010,DATE_MISMATCH,broker trade_date 2026-08-03 vs custodian trade_date 2026-08-04
+T0013,DATE_MISMATCH,broker trade_date 2026-08-05 vs custodian trade_date 2026-08-06
+T0011,DATE_MISMATCH,broker trade_date 2026-08-03 vs custodian trade_date 2026-08-04
+T0036,DUPLICATE,trade booked twice in custodian feed
+C0100,MISSING_IN_BROKER,"present at custodian, no matching broker trade"
+C0101,MISSING_IN_BROKER,"present at custodian, no matching broker trade"
