@@ -136,7 +136,7 @@ def compare_fields(tid, b, c, note=None):
     if b["quantity"] != c["quantity"]:
         out.append({"trade_id": tid, "break_type": "QUANTITY_MISMATCH",
                      "detail": f"broker qty {b['quantity']} vs custodian qty {c['quantity']}" + (f" ({note})" if note else "")})
-    if abs(b["price"] - c["price"]) > 0.001:
+    if abs(b["price"] - c["price"]) / b["price"] > 0.0001:
         out.append({"trade_id": tid, "break_type": "PRICE_MISMATCH",
                      "detail": f"broker price {b['price']} vs custodian price {c['price']}" + (f" ({note})" if note else "")})
     if b["trade_date"] != c["trade_date"]:

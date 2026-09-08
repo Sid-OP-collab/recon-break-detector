@@ -1,5 +1,7 @@
 # Reconciliation Break Detector
 
+![CI](https://github.com/Sid-OP-collab/recon-break-detector/actions/workflows/ci.yml/badge.svg)
+
 A trade-ledger reconciliation engine that matches a fund's own broker/PB
 blotter against a custodian's copy of the same trades, and automatically
 flags and classifies every discrepancy ("break").
