@@ -16,6 +16,11 @@ Break types:
   DATE_MISMATCH        - matched trade, trade_date differs
   DUPLICATE            - more custodian rows for a trade_id than broker rows
 
+Every break also carries a dollar_impact (the $ size of the discrepancy)
+and a severity tier (HIGH/MEDIUM/LOW), so the report can be triaged the
+way a real ops desk would: a $0.02 rounding break on 1 share doesn't need
+anyone's attention; a missing $50k trade does, immediately.
+
 Usage:
     python reconcile.py \
         --broker data/broker_ledger.csv \
@@ -32,6 +37,18 @@ FIELDS = ["trade_id", "ticker", "instrument_type", "side", "quantity", "price",
           "trade_date", "expiry", "strike", "right"]
 
 QUANTITY_TOLERANCE = 1e-6  # float rounding noise, not a real break
+
+# Materiality thresholds ($ notional). Deliberately simple and centralised
+# here so they're easy to tune per-mandate rather than buried in logic.
+HIGH_THRESHOLD = 1_000
+MEDIUM_THRESHOLD = 100
+
+# DATE_MISMATCH is a timing/operational issue, not an economic one - the
+# trade still nets out to the same value, just on the wrong date - so it
+# gets its own, much higher bar before being called HIGH. A $10k trade
+# booked one day late is routine; a $50k+ one still deserves urgent
+# attention because settlement risk scales with size.
+DATE_HIGH_THRESHOLD = 50_000
 
 
 def load_ledger(path):
@@ -76,8 +93,46 @@ def composite_key(row):
     return base
 
 
+def dollar_impact(break_type, b=None, c=None):
+    """$ size of the discrepancy. Where a full trade is missing or
+    duplicated, that's the full notional value at risk. Where a single
+    field differs, it's the $ delta that field represents."""
+    if break_type == "QUANTITY_MISMATCH":
+        return abs(b["quantity"] - c["quantity"]) * b["price"]
+    if break_type == "PRICE_MISMATCH":
+        return abs(b["price"] - c["price"]) * b["quantity"]
+    if break_type == "DATE_MISMATCH":
+        return b["quantity"] * b["price"]
+    if break_type in ("MISSING_IN_CUSTODIAN", "DUPLICATE"):
+        return b["quantity"] * b["price"]
+    if break_type == "MISSING_IN_BROKER":
+        return c["quantity"] * c["price"]
+    return 0.0
+
+
+def classify_severity(break_type, impact):
+    if break_type == "DATE_MISMATCH":
+        return "HIGH" if impact >= DATE_HIGH_THRESHOLD else "LOW"
+    if impact >= HIGH_THRESHOLD:
+        return "HIGH"
+    if impact >= MEDIUM_THRESHOLD:
+        return "MEDIUM"
+    return "LOW"
+
+
+def make_break(trade_id, break_type, detail, b=None, c=None):
+    impact = dollar_impact(break_type, b, c)
+    return {
+        "trade_id": trade_id,
+        "break_type": break_type,
+        "severity": classify_severity(break_type, impact),
+        "dollar_impact": round(impact, 2),
+        "detail": detail,
+    }
+
+
 def reconcile(broker_rows, custodian_rows):
-    breaks = []       # list of dicts: trade_id, break_type, detail
+    breaks = []       # list of break dicts (trade_id, break_type, severity, dollar_impact, detail)
     matched_ok = []    # trade_ids that matched clean
 
     broker_idx = index_by_id(broker_rows)
@@ -100,12 +155,13 @@ def reconcile(broker_rows, custodian_rows):
             continue
 
         # Both sides have this trade_id
-        if len(c_rows) > len(b_rows):
-            breaks.append({
-                "trade_id": tid, "break_type": "DUPLICATE",
-                "detail": f"{len(c_rows)} custodian rows vs {len(b_rows)} broker row(s) for {tid}",
-            })
         b, c = b_rows[0], c_rows[0]
+        if len(c_rows) > len(b_rows):
+            breaks.append(make_break(
+                tid, "DUPLICATE",
+                f"{len(c_rows)} custodian rows vs {len(b_rows)} broker row(s) for {tid}",
+                b=b,
+            ))
         field_breaks = compare_fields(tid, b, c)
         if field_breaks:
             breaks.extend(field_breaks)
@@ -126,26 +182,32 @@ def reconcile(broker_rows, custodian_rows):
         if candidates:
             c = candidates.pop(0)
             field_breaks = compare_fields(b["trade_id"], b, c, note="matched via composite key, trade_id differs or was corrupted")
-            breaks.extend(field_breaks if field_breaks else [{
-                "trade_id": b["trade_id"], "break_type": "DATE_MISMATCH",
-                "detail": f"matched to custodian trade_id {c['trade_id']} via ticker/side/qty only",
-            }])
+            if field_breaks:
+                breaks.extend(field_breaks)
+            else:
+                breaks.append(make_break(
+                    b["trade_id"], "DATE_MISMATCH",
+                    f"matched to custodian trade_id {c['trade_id']} via ticker/side/qty only",
+                    b=b, c=c,
+                ))
         else:
             still_missing_custodian.append(b)
 
     for b in still_missing_custodian:
-        breaks.append({
-            "trade_id": b["trade_id"], "break_type": "MISSING_IN_CUSTODIAN",
-            "detail": f"{b['ticker']} {b['side']} {b['quantity']}@{b['price']} on {b['trade_date']} not found at custodian",
-        })
+        breaks.append(make_break(
+            b["trade_id"], "MISSING_IN_CUSTODIAN",
+            f"{b['ticker']} {b['side']} {b['quantity']}@{b['price']} on {b['trade_date']} not found at custodian",
+            b=b,
+        ))
 
     # Whatever's left in c_by_key (not consumed above) is genuinely missing in broker
     for key, rows in c_by_key.items():
         for c in rows:
-            breaks.append({
-                "trade_id": c["trade_id"], "break_type": "MISSING_IN_BROKER",
-                "detail": f"{c['ticker']} {c['side']} {c['quantity']}@{c['price']} on {c['trade_date']} not found at broker",
-            })
+            breaks.append(make_break(
+                c["trade_id"], "MISSING_IN_BROKER",
+                f"{c['ticker']} {c['side']} {c['quantity']}@{c['price']} on {c['trade_date']} not found at broker",
+                c=c,
+            ))
 
     return breaks, matched_ok
 
@@ -154,8 +216,11 @@ def compare_fields(tid, b, c, note=None):
     """Given a matched broker/custodian pair, return a list of field-level breaks."""
     out = []
     if abs(b["quantity"] - c["quantity"]) > QUANTITY_TOLERANCE:
-        out.append({"trade_id": tid, "break_type": "QUANTITY_MISMATCH",
-                     "detail": f"broker qty {b['quantity']} vs custodian qty {c['quantity']}" + (f" ({note})" if note else "")})
+        out.append(make_break(
+            tid, "QUANTITY_MISMATCH",
+            f"broker qty {b['quantity']} vs custodian qty {c['quantity']}" + (f" ({note})" if note else ""),
+            b=b, c=c,
+        ))
     # Relative (1bp) tolerance normally; falls back to an absolute cent
     # threshold when broker price is exactly 0 (e.g. a free/promo share)
     # since a relative diff is undefined against a zero denominator.
@@ -164,33 +229,54 @@ def compare_fields(tid, b, c, note=None):
         else abs(b["price"] - c["price"]) / b["price"] > 0.0001
     )
     if price_break:
-        out.append({"trade_id": tid, "break_type": "PRICE_MISMATCH",
-                     "detail": f"broker price {b['price']} vs custodian price {c['price']}" + (f" ({note})" if note else "")})
+        out.append(make_break(
+            tid, "PRICE_MISMATCH",
+            f"broker price {b['price']} vs custodian price {c['price']}" + (f" ({note})" if note else ""),
+            b=b, c=c,
+        ))
     if b["trade_date"] != c["trade_date"]:
-        out.append({"trade_id": tid, "break_type": "DATE_MISMATCH",
-                     "detail": f"broker trade_date {b['trade_date']} vs custodian trade_date {c['trade_date']}" + (f" ({note})" if note else "")})
+        out.append(make_break(
+            tid, "DATE_MISMATCH",
+            f"broker trade_date {b['trade_date']} vs custodian trade_date {c['trade_date']}" + (f" ({note})" if note else ""),
+            b=b, c=c,
+        ))
     return out
 
 
 def summarize(breaks, matched_ok, broker_rows, custodian_rows):
     by_type = defaultdict(int)
+    by_severity = defaultdict(int)
+    total_impact = 0.0
     for b in breaks:
         by_type[b["break_type"]] += 1
+        by_severity[b["severity"]] += 1
+        total_impact += b["dollar_impact"]
     return {
         "broker_trade_count": len(broker_rows),
         "custodian_trade_count": len(custodian_rows),
         "clean_matches": len(matched_ok),
         "total_breaks": len(breaks),
+        "total_dollar_impact": round(total_impact, 2),
         "breaks_by_type": dict(sorted(by_type.items())),
+        "breaks_by_severity": {s: by_severity.get(s, 0) for s in ("HIGH", "MEDIUM", "LOW")},
     }
 
 
+SEVERITY_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+
+
+def sort_key(b):
+    return (SEVERITY_ORDER[b["severity"]], -b["dollar_impact"], b["break_type"], b["trade_id"])
+
+
 def write_report(breaks, summary, out_dir):
+    sorted_breaks = sorted(breaks, key=sort_key)
+
     csv_path = f"{out_dir.rstrip('/')}/breaks_report.csv"
     with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["trade_id", "break_type", "detail"])
+        writer = csv.DictWriter(f, fieldnames=["trade_id", "break_type", "severity", "dollar_impact", "detail"])
         writer.writeheader()
-        for b in sorted(breaks, key=lambda x: (x["break_type"], x["trade_id"])):
+        for b in sorted_breaks:
             writer.writerow(b)
 
     md_path = f"{out_dir.rstrip('/')}/breaks_report.md"
@@ -199,15 +285,23 @@ def write_report(breaks, summary, out_dir):
         f.write(f"- Broker trades: **{summary['broker_trade_count']}**\n")
         f.write(f"- Custodian trades: **{summary['custodian_trade_count']}**\n")
         f.write(f"- Clean matches: **{summary['clean_matches']}**\n")
-        f.write(f"- Total breaks: **{summary['total_breaks']}**\n\n")
-        f.write("## Breaks by type\n\n")
+        f.write(f"- Total breaks: **{summary['total_breaks']}**\n")
+        f.write(f"- Total $ impact: **${summary['total_dollar_impact']:,.2f}**\n\n")
+
+        f.write("## Breaks by severity\n\n")
+        f.write("| Severity | Count |\n|---|---|\n")
+        for sev in ("HIGH", "MEDIUM", "LOW"):
+            f.write(f"| {sev} | {summary['breaks_by_severity'][sev]} |\n")
+
+        f.write("\n## Breaks by type\n\n")
         f.write("| Break type | Count |\n|---|---|\n")
         for btype, count in summary["breaks_by_type"].items():
             f.write(f"| {btype} | {count} |\n")
-        f.write("\n## Break detail\n\n")
-        f.write("| Trade ID | Break Type | Detail |\n|---|---|---|\n")
-        for b in sorted(breaks, key=lambda x: (x["break_type"], x["trade_id"])):
-            f.write(f"| {b['trade_id']} | {b['break_type']} | {b['detail']} |\n")
+
+        f.write("\n## Break detail (sorted by severity, then $ impact)\n\n")
+        f.write("| Severity | $ Impact | Trade ID | Break Type | Detail |\n|---|---|---|---|---|\n")
+        for b in sorted_breaks:
+            f.write(f"| {b['severity']} | ${b['dollar_impact']:,.2f} | {b['trade_id']} | {b['break_type']} | {b['detail']} |\n")
 
     return csv_path, md_path
 
@@ -231,6 +325,10 @@ def main():
     print(f"Custodian trades: {summary['custodian_trade_count']}")
     print(f"Clean matches:    {summary['clean_matches']}")
     print(f"Total breaks:     {summary['total_breaks']}")
+    print(f"Total $ impact:   ${summary['total_dollar_impact']:,.2f}")
+    print("Breaks by severity:")
+    for sev in ("HIGH", "MEDIUM", "LOW"):
+        print(f"  {sev}: {summary['breaks_by_severity'][sev]}")
     print("Breaks by type:")
     for btype, count in summary["breaks_by_type"].items():
         print(f"  {btype}: {count}")

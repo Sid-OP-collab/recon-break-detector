@@ -58,9 +58,24 @@ services."*
    treated the same as one on a $10 stock — with a fallback to an absolute
    threshold for the one real trade in this dataset booked at $0 (a
    promotional fractional share), where a relative tolerance is undefined.
+
+   **Every break carries a materiality score.** A `dollar_impact` figure
+   (the $ size of the discrepancy) and a `severity` tier (HIGH/MEDIUM/LOW)
+   get computed for each break, and the report sorts by severity first —
+   the way a real ops desk triages, since a $0.02 rounding difference
+   doesn't need the same attention as a missing $50k trade. DATE_MISMATCH
+   is treated differently: since a trade booked on the wrong date still
+   nets to the same value, it uses a much higher bar ($50k) before being
+   called HIGH, rather than the standard $1k threshold used for economic
+   breaks (quantity/price/missing/duplicate). Thresholds are constants at
+   the top of `reconcile.py`, deliberately simple and easy to retune — on
+   my own (small, fractional-share) real trade history, nothing crosses
+   the HIGH bar at all, which is itself the correct behaviour for a
+   retail-sized portfolio; a fund with institutional trade sizes would
+   want these thresholds set much higher.
 3. Output: a CSV and a Markdown report (`output/breaks_report.csv/.md`)
-   listing every break with a human-readable explanation, plus a summary
-   count by break type.
+   listing every break — sorted by severity, then $ impact — with a
+   human-readable explanation, plus summary counts by severity and type.
 
 ## Scope and data notes
 

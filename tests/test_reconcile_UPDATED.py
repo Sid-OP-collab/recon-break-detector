@@ -164,3 +164,51 @@ def test_no_trade_silently_dropped():
     accounted_for = set(matched) | {b["trade_id"] for b in breaks}
     assert "T0001" in accounted_for
     assert "T0002" in accounted_for
+
+
+def test_severity_scales_with_dollar_impact():
+    """A tiny quantity mismatch on a cheap stock should be LOW severity;
+    a large one on an expensive stock should be HIGH - same break TYPE,
+    different materiality."""
+    b_small = make_trade("T0001", ticker="F", quantity=10, price=12.0)
+    c_small = make_trade("T0001", ticker="F", quantity=10.5, price=12.0)  # $6 impact
+    breaks_small, _ = reconcile([b_small], [c_small])
+    assert breaks_small[0]["severity"] == "LOW"
+
+    b_large = make_trade("T0002", ticker="NVDA", quantity=100, price=900.0)
+    c_large = make_trade("T0002", ticker="NVDA", quantity=105, price=900.0)  # $4500 impact
+    breaks_large, _ = reconcile([b_large], [c_large])
+    assert breaks_large[0]["severity"] == "HIGH"
+
+
+def test_missing_trade_impact_equals_full_notional():
+    """A missing trade's dollar impact is the full quantity*price of the
+    trade that's gone missing, not some partial figure."""
+    b = make_trade("T0001", quantity=10, price=250.0)  # $2500 notional
+    breaks, _ = reconcile([b], [])
+    assert breaks[0]["break_type"] == "MISSING_IN_CUSTODIAN"
+    assert breaks[0]["dollar_impact"] == 2500.0
+    assert breaks[0]["severity"] == "HIGH"
+
+
+def test_date_mismatch_severity_uses_higher_bar():
+    """DATE_MISMATCH is a timing issue, not an economic one, so it should
+    stay LOW severity even at a notional that would be HIGH for a
+    quantity or price break - unless it crosses the much higher
+    settlement-risk threshold."""
+    b = make_trade("T0001", quantity=10, price=500.0, trade_date="2026-08-03")  # $5000 notional
+    c = make_trade("T0001", quantity=10, price=500.0, trade_date="2026-08-04")
+    breaks, _ = reconcile([b], [c])
+    assert breaks[0]["break_type"] == "DATE_MISMATCH"
+    assert breaks[0]["severity"] == "LOW"  # $5k is well under the $50k date-mismatch bar
+
+
+def test_breaks_report_sorted_high_severity_first():
+    """The whole point of severity is triage - HIGH breaks must sort to
+    the top of the report, regardless of trade_id or break type order."""
+    from reconcile import sort_key
+    low = {"severity": "LOW", "dollar_impact": 5.0, "break_type": "PRICE_MISMATCH", "trade_id": "T0001"}
+    high = {"severity": "HIGH", "dollar_impact": 5000.0, "break_type": "MISSING_IN_CUSTODIAN", "trade_id": "T0002"}
+    medium = {"severity": "MEDIUM", "dollar_impact": 300.0, "break_type": "QUANTITY_MISMATCH", "trade_id": "T0003"}
+    ordered = sorted([low, high, medium], key=sort_key)
+    assert [b["severity"] for b in ordered] == ["HIGH", "MEDIUM", "LOW"]
